@@ -133,6 +133,20 @@ function sanitizeForDocusaurus(content) {
     },
   );
 
+  // Self-close void HTML elements (img, source) so MDX doesn't complain about
+  // mismatched tags. e.g. <img src="…"> → <img src="…" />
+  // Split on fenced and inline code spans to leave their content untouched.
+  content = content
+    .split(/(```[\s\S]*?```|`[^`]+`)/)
+    .map((seg, i) => {
+      if (i % 2 === 1) return seg; // inside a code span/block — leave as-is
+      return seg.replace(/<(img|source)(\s[^>]*?)?\s*>/gi, (match, tag, attrs = "") => {
+        if (match.endsWith("/>")) return match; // already self-closing
+        return `<${tag}${attrs} />`;
+      });
+    })
+    .join("");
+
   // Escape bare `<` characters outside code blocks that are clearly comparison
   // operators (followed by a digit, whitespace, or vulgar-fraction Unicode chars)
   // to prevent MDX from misinterpreting them as JSX element starts.
