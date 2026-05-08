@@ -168,8 +168,8 @@ function sanitizeForDocusaurus(content) {
 /**
  * Ensure Jekyll / generic frontmatter is Docusaurus-compatible.
  * - If there is no `title` field, derive one from the filename.
- * - `layout` is harmless in Docusaurus but we leave it; callers can strip it
- *   by adjusting this function if desired.
+ * - Converts `nav_order` → `sidebar_position` (Docusaurus uses the latter).
+ * - Strips Jekyll-only fields: `has_children`, `layout`.
  */
 function ensureFrontmatter(content, filename) {
   const frontmatterRe = /^---\r?\n([\s\S]*?)\r?\n---/;
@@ -184,18 +184,28 @@ function ensureFrontmatter(content, filename) {
     return `---\ntitle: ${title}\n---\n\n${content}`;
   }
 
-  const block = match[1];
+  let block = match[1];
+
+  // Ensure title is present.
   if (!/^title\s*:/m.test(block)) {
     const title = path
       .basename(filename, path.extname(filename))
       .replace(/[-_]/g, " ")
       .replace(/\b\w/g, (c) => c.toUpperCase());
-    const updated = content.replace(
-      frontmatterRe,
-      `---\ntitle: ${title}\n${block}\n---`,
-    );
-    return updated;
+    block = `title: ${title}\n${block}`;
   }
+
+  // Convert Jekyll nav_order → Docusaurus sidebar_position.
+  if (/^nav_order\s*:/m.test(block) && !/^sidebar_position\s*:/m.test(block)) {
+    block = block.replace(/^nav_order(\s*:\s*\d+\s*)$/m, "sidebar_position$1");
+  }
+
+  // Remove Jekyll-only fields that are meaningless or cause noise in Docusaurus.
+  block = block.replace(/^has_children\s*:.*\n?/m, "");
+  block = block.replace(/^layout\s*:.*\n?/m, "");
+
+  // Rebuild frontmatter (trim trailing whitespace that removal may leave).
+  content = content.replace(frontmatterRe, `---\n${block.trimEnd()}\n---`);
 
   return content;
 }
@@ -243,13 +253,37 @@ async function main() {
   const sourceImageBasenames = new Set(
     sourceImageFiles.map((f) => path.basename(f)),
   );
-  const sourceMdBasenames = new Set(sourceMdFiles.map((f) => path.basename(f)));
+
+  // Landing pages from the Apple repo root are remapped to become the Docusaurus
+  // index page for their respective category subdirectory.  Docusaurus treats
+  // <dir>/index.md as the category landing page automatically.
+  const LANDING_PAGE_MAP = {
+    "user.md": path.join("user", "index.md"),
+    "developer.md": path.join("developer", "index.md"),
+  };
+
+  /**
+   * Given a source-relative path, return the dest-relative path that should be
+   * used inside DEST_DOCS_DIR.  Landing pages at the source root are remapped
+   * into their subdirectory as index.md; everything else keeps its relative path.
+   */
+  function destRelPath(relPath) {
+    const basename = path.basename(relPath);
+    if (path.dirname(relPath) === "." && LANDING_PAGE_MAP[basename]) {
+      return LANDING_PAGE_MAP[basename];
+    }
+    return relPath;
+  }
+
+  // Build the set of expected dest-relative paths for cleanup later.
+  const expectedDestMdPaths = new Set(sourceMdFiles.map(destRelPath));
 
   // ── Sync Markdown files ───────────────────────────────────────────────────
 
   for (const relPath of sourceMdFiles) {
     const srcFile = path.join(SRC_DOCS_DIR, relPath);
-    const destFile = path.join(DEST_DOCS_DIR, path.basename(relPath));
+    const dRelPath = destRelPath(relPath);
+    const destFile = path.join(DEST_DOCS_DIR, dRelPath);
 
     let content = fs.readFileSync(srcFile, "utf8");
     content = ensureFrontmatter(content, relPath);
@@ -262,13 +296,13 @@ async function main() {
     if (!exists) {
       fs.mkdirSync(path.dirname(destFile), { recursive: true });
       fs.writeFileSync(destFile, content);
-      console.log(`[ADD]    docs: ${path.basename(relPath)}`);
+      console.log(`[ADD]    docs: ${dRelPath}`);
     } else if (existingContent !== content) {
       fs.mkdirSync(path.dirname(destFile), { recursive: true });
       fs.writeFileSync(destFile, content);
-      console.log(`[UPDATE] docs: ${path.basename(relPath)}`);
+      console.log(`[UPDATE] docs: ${dRelPath}`);
     } else {
-      console.log(`[SKIP]   docs: ${path.basename(relPath)} (unchanged)`);
+      console.log(`[SKIP]   docs: ${dRelPath} (unchanged)`);
     }
   }
 
@@ -298,15 +332,18 @@ async function main() {
   // ── Cleanup: remove files no longer in source ─────────────────────────────
 
   // Markdown — walk the full destination tree so subdirectories are covered.
+  // Compare against the full dest-relative paths (not just basenames) so that
+  // files that moved from the flat layout into subdirectories are cleaned up.
   const existingMdFiles = collectFiles(DEST_DOCS_DIR).filter((f) =>
     MD_EXTENSIONS.has(path.extname(f).toLowerCase()),
   );
 
   for (const file of existingMdFiles) {
-    const basename = path.basename(file);
-    if (!sourceMdBasenames.has(basename)) {
+    // Normalize separators for cross-platform safety.
+    const normalised = file.split(path.sep).join("/");
+    if (!expectedDestMdPaths.has(normalised)) {
       fs.unlinkSync(path.join(DEST_DOCS_DIR, file));
-      console.log(`[REMOVE] docs: ${basename}`);
+      console.log(`[REMOVE] docs: ${normalised}`);
     }
   }
 
