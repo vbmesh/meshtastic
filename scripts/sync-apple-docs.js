@@ -166,6 +166,92 @@ function sanitizeForDocusaurus(content) {
 }
 
 /**
+ * Rewrite internal doc links so they resolve correctly after files are placed
+ * into `user/` or `developer/` subdirectories.
+ *
+ * Docusaurus resolves relative links relative to the **page URL**, not the file
+ * path on disk.  A file at `developer/architecture.md` has the page URL
+ * `/docs/software/apple/developer/architecture/`.  From there:
+ *
+ *   - A bare link `deep-links`      resolves to …/architecture/deep-links/  ✗
+ *     It should be                               …/developer/deep-links/
+ *     Fix: prepend `../`
+ *
+ *   - A link `../user/carplay`      resolves to …/developer/user/carplay/   ✗
+ *     It should be                               …/user/carplay/
+ *     Fix: prepend another `../`  →  `../../user/carplay`
+ *
+ * For the category landing pages (user/index.md, developer/index.md):
+ *   - A link `user/signal-meter`    resolves to …/user/user/signal-meter/   ✗
+ *     Fix: strip the same-subdir prefix  →  `signal-meter`
+ *
+ * @param {string} content    Markdown source.
+ * @param {string} dRelPath   Dest-relative path, e.g. "user/carplay.md" or
+ *                            "developer/index.md".  Uses forward slashes.
+ */
+function rewriteInternalDocLinks(content, dRelPath) {
+  const normalised = dRelPath.split(path.sep).join("/");
+  const parts = normalised.split("/");
+  const subdir = parts.length >= 2 ? parts[0] : null; // "user" | "developer" | null
+  const isLandingPage = parts.length === 2 && parts[1] === "index.md";
+  const isSubdirFile = subdir === "user" || subdir === "developer";
+
+  if (!isSubdirFile) return content; // root-level files need no adjustment
+
+  /**
+   * Rewrite a single link target extracted from Markdown or HTML.
+   * Only touches relative links (not starting with `/`, `http`, `#`, or `mailto`).
+   */
+  function fixLink(target) {
+    if (!target) return target;
+    // Leave absolute URLs, absolute paths, fragment-only, and mailto links.
+    if (/^(https?:|mailto:|\/|#)/.test(target)) return target;
+
+    // ── Landing page rules ────────────────────────────────────────────────
+    if (isLandingPage) {
+      // Strip same-subdir prefix: "user/foo" → "foo", "developer/foo" → "foo"
+      if (target.startsWith(`${subdir}/`)) {
+        return target.slice(subdir.length + 1);
+      }
+      return target;
+    }
+
+    // ── Non-landing subdir file rules ─────────────────────────────────────
+
+    // Cross-subdir links written as "../user/…" or "../developer/…":
+    // add one more "../" so they escape the current subdir in the URL.
+    if (/^\.\.\/(user|developer)\//.test(target)) {
+      return `../${target}`;
+    }
+
+    // Bare relative links (no leading "../", "./", or "/"):
+    // these are sibling-file links.  Prepend "../" so the URL resolves to
+    // the parent `user/` or `developer/` slug, not deeper inside the page.
+    if (!/^(\.\.\/|\.\/)/.test(target)) {
+      return `../${target}`;
+    }
+
+    return target;
+  }
+
+  // Rewrite Markdown links: [text](target) and [text](target "title")
+  content = content.replace(
+    /\[([^\]]*)\]\(([^)]+)\)/g,
+    (match, text, raw) => {
+      // Split off optional title: "path" or "path \"title\""
+      const titleMatch = raw.match(/^(.*?)\s+"([^"]*)"$/);
+      if (titleMatch) {
+        const fixed = fixLink(titleMatch[1].trim());
+        return `[${text}](${fixed} "${titleMatch[2]}")`;
+      }
+      return `[${text}](${fixLink(raw.trim())})`;
+    },
+  );
+
+  return content;
+}
+
+/**
  * Ensure Jekyll / generic frontmatter is Docusaurus-compatible.
  * - If there is no `title` field, derive one from the filename.
  * - Converts `nav_order` → `sidebar_position` (Docusaurus uses the latter).
@@ -289,6 +375,7 @@ async function main() {
     content = ensureFrontmatter(content, relPath);
     content = rewriteImagePaths(content);
     content = sanitizeForDocusaurus(content);
+    content = rewriteInternalDocLinks(content, dRelPath.split(path.sep).join("/"));
 
     const exists = fs.existsSync(destFile);
     const existingContent = exists ? fs.readFileSync(destFile, "utf8") : null;
